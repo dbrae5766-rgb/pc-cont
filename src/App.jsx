@@ -9,45 +9,43 @@ const ICE_SERVERS = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
-    {
-      urls: "turn:openrelay.metered.ca:80",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
+    { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
   ],
 };
 
+const COLORS = ["#ef4444","#f97316","#eab308","#22c55e","#3b82f6","#a855f7","#ffffff","#000000"];
+const WIDTHS = [2, 4, 8, 16];
+
 export default function App() {
-  const [status, setStatus] = useState("idle");
-  const [error, setError] = useState(null);
+  const [status, setStatus]             = useState("idle");
+  const [error, setError]               = useState(null);
   const [isPointerLocked, setIsPointerLocked] = useState(false);
-  const [resolution, setResolution] = useState({ w: 0, h: 0 });
-  const [fps, setFps] = useState(0);
+  const [resolution, setResolution]     = useState({ w: 0, h: 0 });
+  const [fps, setFps]                   = useState(0);
   const [remoteCursor, setRemoteCursor] = useState({ x: -100, y: -100, sw: 1920, sh: 1080 });
-  const [gameMouseLocked, setGameMouseLocked] = useState(false); // host game has cursor locked
 
-  const videoRef        = useRef(null);
-  const pcRef           = useRef(null);
-  const channelRef      = useRef(null);
-  const dataChannelRef  = useRef(null);
-  const supabaseRef     = useRef(null);
-  const fpsCounterRef   = useRef({ frames: 0, last: Date.now() });
-  const containerRef    = useRef(null);
-  const gameLockedRef   = useRef(false); // ref mirror for use inside callbacks
+  // Drawing state
+  const [drawMode, setDrawMode]   = useState(false);
+  const [drawColor, setDrawColor] = useState("#ef4444");
+  const [drawWidth, setDrawWidth] = useState(4);
+  const isDrawing                 = useRef(false);
 
-  // ── Signaling ───────────────────────────────────────────────────────────
+  const videoRef       = useRef(null);
+  const pcRef          = useRef(null);
+  const channelRef     = useRef(null);
+  const dataChannelRef = useRef(null);
+  const supabaseRef    = useRef(null);
+  const fpsCounterRef  = useRef({ frames: 0, last: Date.now() });
+  const containerRef   = useRef(null);
+
+  // ── Signaling ─────────────────────────────────────────────────────────
   const setupSignaling = useCallback(async () => {
     const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
     supabaseRef.current = supabase;
-    const channel = supabase.channel(CHANNEL_NAME, {
-      config: { broadcast: { self: false } },
-    });
+    const channel = supabase.channel(CHANNEL_NAME, { config: { broadcast: { self: false } } });
     channelRef.current = channel;
-    channel.on("broadcast", { event: "signal" }, async ({ payload }) => {
-      await handleSignal(payload);
-    });
+    channel.on("broadcast", { event: "signal" }, async ({ payload }) => { await handleSignal(payload); });
     await channel.subscribe();
-    return channel;
   }, []);
 
   const broadcast = useCallback(async (payload) => {
@@ -60,23 +58,12 @@ export default function App() {
       setRemoteCursor({ x: data.x, y: data.y, sw: data.sw, sh: data.sh });
       return;
     }
-    if (data.type === "cursor-lock-change") {
-      setGameMouseLocked(data.locked);
-      gameLockedRef.current = data.locked;
-      // Auto-acquire pointer lock on browser side when game locks mouse
-      if (data.locked && containerRef.current) {
-        containerRef.current.requestPointerLock();
-      }
-      return;
-    }
-
     const pc = pcRef.current;
     if (!pc) return;
     if (data.type === "answer") {
       await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: data.sdp }));
     } else if (data.type === "ice-candidate" && data.candidate) {
-      try { await pc.addIceCandidate(new RTCIceCandidate(data)); }
-      catch (e) { console.warn("ICE candidate error:", e); }
+      try { await pc.addIceCandidate(new RTCIceCandidate(data)); } catch {}
     } else if (data.type === "agent-ready") {
       await initiateOffer();
     }
@@ -92,62 +79,40 @@ export default function App() {
 
   const connect = useCallback(async () => {
     try {
-      setStatus("connecting");
-      setError(null);
+      setStatus("connecting"); setError(null);
       const pc = new RTCPeerConnection(ICE_SERVERS);
       pcRef.current = pc;
       const dc = pc.createDataChannel("input", { ordered: false, maxRetransmits: 0 });
       dataChannelRef.current = dc;
-      dc.onopen  = () => console.log("Data channel open");
-      dc.onclose = () => console.log("Data channel closed");
       pc.ontrack = (event) => {
         if (videoRef.current && event.streams[0]) {
           videoRef.current.srcObject = event.streams[0];
           setStatus("connected");
-          const track    = event.streams[0].getVideoTracks()[0];
-          const settings = track.getSettings();
-          setResolution({ w: settings.width || 0, h: settings.height || 0 });
+          const s = event.streams[0].getVideoTracks()[0].getSettings();
+          setResolution({ w: s.width || 0, h: s.height || 0 });
         }
       };
-      pc.onicecandidate = async (event) => {
-        if (event.candidate) {
-          await broadcast({
-            type: "ice-candidate",
-            candidate: event.candidate.candidate,
-            sdpMid: event.candidate.sdpMid,
-            sdpMLineIndex: event.candidate.sdpMLineIndex,
-          });
-        }
+      pc.onicecandidate = async (e) => {
+        if (e.candidate) await broadcast({ type: "ice-candidate", candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex });
       };
       pc.onconnectionstatechange = () => {
-        if (["failed", "disconnected"].includes(pc.connectionState)) {
-          setStatus("error");
-          setError("Connection lost. Is the agent running?");
-        }
+        if (["failed","disconnected"].includes(pc.connectionState)) { setStatus("error"); setError("Connection lost."); }
       };
       await setupSignaling();
       await broadcast({ type: "browser-connected" });
-      setTimeout(async () => {
-        if (status !== "connected") await initiateOffer();
-      }, 3000);
-    } catch (e) {
-      setStatus("error");
-      setError(e.message);
-    }
+      setTimeout(async () => { if (status !== "connected") await initiateOffer(); }, 3000);
+    } catch (e) { setStatus("error"); setError(e.message); }
   }, [setupSignaling, broadcast, initiateOffer]);
 
   const disconnect = useCallback(async () => {
-    if (pcRef.current)    { pcRef.current.close(); pcRef.current = null; }
-    if (channelRef.current) { await channelRef.current.unsubscribe(); channelRef.current = null; }
+    pcRef.current?.close(); pcRef.current = null;
+    await channelRef.current?.unsubscribe(); channelRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
     document.exitPointerLock?.();
-    setStatus("idle");
-    setIsPointerLocked(false);
-    setGameMouseLocked(false);
-    gameLockedRef.current = false;
+    setStatus("idle"); setIsPointerLocked(false);
   }, []);
 
-  // ── Input ───────────────────────────────────────────────────────────────
+  // ── Input ─────────────────────────────────────────────────────────────
   const send = useCallback((cmd) => {
     const dc = dataChannelRef.current;
     if (dc && dc.readyState === "open") dc.send(JSON.stringify(cmd));
@@ -159,138 +124,124 @@ export default function App() {
     const cr   = video.getBoundingClientRect();
     const vidW = resolution.w || video.videoWidth  || 1920;
     const vidH = resolution.h || video.videoHeight || 1080;
-    const ca   = cr.width / cr.height;
-    const va   = vidW / vidH;
+    const ca = cr.width / cr.height, va = vidW / vidH;
     let renderW, renderH, offsetX, offsetY;
-    if (ca > va) {
-      renderH = cr.height; renderW = renderH * va;
-      offsetX = (cr.width - renderW) / 2; offsetY = 0;
-    } else {
-      renderW = cr.width; renderH = renderW / va;
-      offsetX = 0; offsetY = (cr.height - renderH) / 2;
-    }
+    if (ca > va) { renderH = cr.height; renderW = renderH * va; offsetX = (cr.width - renderW) / 2; offsetY = 0; }
+    else         { renderW = cr.width;  renderH = renderW / va; offsetX = 0; offsetY = (cr.height - renderH) / 2; }
     return { renderW, renderH, offsetX, offsetY, vidW, vidH };
   }, [resolution]);
 
   const getScaledCoords = useCallback((e) => {
     const r = getRenderRect();
     if (!r) return { x: 0, y: 0 };
-    const cr     = videoRef.current.getBoundingClientRect();
-    const mouseX = e.clientX - cr.left - r.offsetX;
-    const mouseY = e.clientY - cr.top  - r.offsetY;
+    const cr = videoRef.current.getBoundingClientRect();
     return {
-      x: Math.round(Math.max(0, Math.min(r.vidW, (mouseX / r.renderW) * r.vidW))),
-      y: Math.round(Math.max(0, Math.min(r.vidH, (mouseY / r.renderH) * r.vidH))),
+      x: Math.round(Math.max(0, Math.min(r.vidW, ((e.clientX - cr.left - r.offsetX) / r.renderW) * r.vidW))),
+      y: Math.round(Math.max(0, Math.min(r.vidH, ((e.clientY - cr.top  - r.offsetY) / r.renderH) * r.vidH))),
     };
   }, [getRenderRect]);
 
   const getCursorPixelPos = useCallback(() => {
     const r = getRenderRect();
     if (!r) return { left: -100, top: -100 };
-    const vx = (remoteCursor.x / remoteCursor.sw) * r.vidW;
-    const vy = (remoteCursor.y / remoteCursor.sh) * r.vidH;
     return {
-      left: r.offsetX + (vx / r.vidW) * r.renderW,
-      top:  r.offsetY + (vy / r.vidH) * r.renderH,
+      left: r.offsetX + (remoteCursor.x / remoteCursor.sw) * r.renderW,
+      top:  r.offsetY + (remoteCursor.y / remoteCursor.sh) * r.renderH,
     };
   }, [remoteCursor, getRenderRect]);
 
-  const enablePointerLock = useCallback(() => {
-    containerRef.current?.requestPointerLock();
-  }, []);
+  const enablePointerLock = useCallback(() => { containerRef.current?.requestPointerLock(); }, []);
 
   useEffect(() => {
-    const onLockChange = () => {
-      setIsPointerLocked(document.pointerLockElement === containerRef.current);
-    };
-    document.addEventListener("pointerlockchange", onLockChange);
-    return () => document.removeEventListener("pointerlockchange", onLockChange);
+    const fn = () => setIsPointerLocked(document.pointerLockElement === containerRef.current);
+    document.addEventListener("pointerlockchange", fn);
+    return () => document.removeEventListener("pointerlockchange", fn);
   }, []);
 
-  // Accumulated absolute position for non-game pointer lock
   const accPos = useRef({ x: 960, y: 540 });
 
+  // ── Mouse handlers — draw mode vs control mode ─────────────────────────
   const handleMouseMove = useCallback((e) => {
-    const gameLocked = gameLockedRef.current;
-
-    if (gameLocked) {
-      // Game has cursor confined — always send raw deltas, browser must be pointer-locked
-      send({ type: "mousemove", dx: e.movementX, dy: e.movementY });
+    if (drawMode) {
+      if (!isDrawing.current) return;
+      const { x, y } = getScaledCoords(e);
+      send({ type: "draw-point", x, y, color: drawColor, width: drawWidth });
       return;
     }
-
     if (!isPointerLocked) {
-      // Normal absolute mode
       const { x, y } = getScaledCoords(e);
       send({ type: "mousemove", x, y });
     } else {
-      // Pointer-locked non-game: accumulate delta → absolute
       const r = getRenderRect();
       if (!r) return;
       accPos.current.x = Math.max(0, Math.min(r.vidW, accPos.current.x + e.movementX * (r.vidW / r.renderW)));
       accPos.current.y = Math.max(0, Math.min(r.vidH, accPos.current.y + e.movementY * (r.vidH / r.renderH)));
       send({ type: "mousemove", x: Math.round(accPos.current.x), y: Math.round(accPos.current.y) });
     }
-  }, [isPointerLocked, getScaledCoords, getRenderRect, send]);
+  }, [drawMode, drawColor, drawWidth, isPointerLocked, getScaledCoords, getRenderRect, send]);
 
   const handleMouseDown = useCallback((e) => {
     e.preventDefault();
-    const btn    = ["left", "middle", "right"][e.button] || "left";
-    const { x, y } = getScaledCoords(e);
-    send({ type: "mousedown", button: btn, x, y });
-  }, [getScaledCoords, send]);
+    if (drawMode) {
+      isDrawing.current = true;
+      const { x, y } = getScaledCoords(e);
+      send({ type: "draw-point", x, y, color: drawColor, width: drawWidth, start: true });
+      return;
+    }
+    send({ type: "mousedown", button: ["left","middle","right"][e.button] || "left", ...getScaledCoords(e) });
+  }, [drawMode, drawColor, drawWidth, getScaledCoords, send]);
 
   const handleMouseUp = useCallback((e) => {
-    const btn    = ["left", "middle", "right"][e.button] || "left";
-    const { x, y } = getScaledCoords(e);
-    send({ type: "mouseup", button: btn, x, y });
-  }, [getScaledCoords, send]);
+    if (drawMode) {
+      isDrawing.current = false;
+      send({ type: "draw-end" });
+      return;
+    }
+    send({ type: "mouseup", button: ["left","middle","right"][e.button] || "left", ...getScaledCoords(e) });
+  }, [drawMode, getScaledCoords, send]);
 
   const handleWheel = useCallback((e) => {
+    if (drawMode) return;
     e.preventDefault();
-    const { x, y } = getScaledCoords(e);
-    send({ type: "scroll", x, y, deltaY: e.deltaY });
-  }, [getScaledCoords, send]);
+    send({ type: "scroll", ...getScaledCoords(e), deltaY: e.deltaY });
+  }, [drawMode, getScaledCoords, send]);
 
   const handleKeyDown = useCallback((e) => {
-    if (status !== "connected") return;
+    if (status !== "connected" || drawMode) return;
     e.preventDefault();
     send({ type: "keydown", key: e.key, code: e.code });
-  }, [status, send]);
+  }, [status, drawMode, send]);
 
   const handleKeyUp = useCallback((e) => {
-    if (status !== "connected") return;
+    if (status !== "connected" || drawMode) return;
     e.preventDefault();
     send({ type: "keyup", key: e.key, code: e.code });
-  }, [status, send]);
+  }, [status, drawMode, send]);
 
   useEffect(() => {
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", handleKeyUp);
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("keyup", handleKeyUp);
-    };
+    return () => { window.removeEventListener("keydown", handleKeyDown); window.removeEventListener("keyup", handleKeyUp); };
   }, [handleKeyDown, handleKeyUp]);
 
   useEffect(() => {
     if (status !== "connected") return;
-    const interval = setInterval(() => {
-      const now     = Date.now();
-      const elapsed = (now - fpsCounterRef.current.last) / 1000;
+    const iv = setInterval(() => {
+      const now = Date.now(), elapsed = (now - fpsCounterRef.current.last) / 1000;
       setFps(Math.round(fpsCounterRef.current.frames / elapsed));
       fpsCounterRef.current = { frames: 0, last: now };
     }, 1000);
-    const video   = videoRef.current;
-    const onFrame = () => { fpsCounterRef.current.frames++; };
-    video?.addEventListener("timeupdate", onFrame);
-    return () => { clearInterval(interval); video?.removeEventListener("timeupdate", onFrame); };
+    const video = videoRef.current;
+    const onF = () => { fpsCounterRef.current.frames++; };
+    video?.addEventListener("timeupdate", onF);
+    return () => { clearInterval(iv); video?.removeEventListener("timeupdate", onF); };
   }, [status]);
 
   const cursorPos = getCursorPixelPos();
 
   return (
     <div style={styles.root}>
+      {/* Header */}
       <div style={styles.header}>
         <div style={styles.logo}>
           <span style={styles.logoIcon}>⬡</span>
@@ -301,34 +252,77 @@ export default function App() {
             <>
               <span style={styles.stat}>{fps} fps</span>
               {resolution.w > 0 && <span style={styles.stat}>{resolution.w}×{resolution.h}</span>}
-              {gameMouseLocked && <span style={{ ...styles.stat, color: "#f59e0b" }}>🎮 game lock</span>}
               <span style={{ ...styles.dot, background: "#22c55e" }} />
             </>
           )}
-          {status === "connecting" && (
-            <>
-              <span style={styles.stat}>Connecting…</span>
-              <span style={{ ...styles.dot, background: "#f59e0b", animation: "pulse 1s infinite" }} />
-            </>
-          )}
+          {status === "connecting" && <><span style={styles.stat}>Connecting…</span><span style={{ ...styles.dot, background: "#f59e0b", animation: "pulse 1s infinite" }} /></>}
           {status === "idle"  && <span style={styles.stat}>Not connected</span>}
           {status === "error" && <span style={{ ...styles.stat, color: "#f87171" }}>{error}</span>}
         </div>
         <div style={styles.controls}>
-          {(isPointerLocked || gameMouseLocked) && (
-            <span style={styles.hint}>Press ESC to release mouse</span>
-          )}
-          {status === "connected" && !isPointerLocked && !gameMouseLocked && (
+          {isPointerLocked && <span style={styles.hint}>ESC to release mouse</span>}
+          {status === "connected" && !isPointerLocked && !drawMode && (
             <button style={styles.btn} onClick={enablePointerLock}>Lock Mouse</button>
           )}
-          {status !== "connected" && status !== "connecting" ? (
-            <button style={{ ...styles.btn, ...styles.btnPrimary }} onClick={connect}>Connect</button>
-          ) : (
-            <button style={{ ...styles.btn, ...styles.btnDanger }} onClick={disconnect}>Disconnect</button>
-          )}
+          {status !== "connected" && status !== "connecting"
+            ? <button style={{ ...styles.btn, ...styles.btnPrimary }} onClick={connect}>Connect</button>
+            : <button style={{ ...styles.btn, ...styles.btnDanger }} onClick={disconnect}>Disconnect</button>
+          }
         </div>
       </div>
 
+      {/* Drawing toolbar — only when connected */}
+      {status === "connected" && (
+        <div style={styles.toolbar}>
+          {/* Mode toggle */}
+          <button
+            style={{ ...styles.toolBtn, ...(drawMode ? styles.toolBtnActive : {}) }}
+            onClick={() => setDrawMode(m => !m)}
+            title="Draw mode"
+          >
+            ✏️ {drawMode ? "Drawing" : "Draw"}
+          </button>
+
+          {drawMode && (
+            <>
+              <div style={styles.toolDivider} />
+              {/* Color picker */}
+              {COLORS.map(c => (
+                <button
+                  key={c}
+                  onClick={() => setDrawColor(c)}
+                  style={{
+                    ...styles.colorSwatch,
+                    background: c,
+                    boxShadow: drawColor === c ? `0 0 0 2px #fff, 0 0 0 4px ${c}` : "none",
+                  }}
+                />
+              ))}
+              <div style={styles.toolDivider} />
+              {/* Width picker */}
+              {WIDTHS.map(w => (
+                <button
+                  key={w}
+                  onClick={() => setDrawWidth(w)}
+                  style={{ ...styles.toolBtn, ...(drawWidth === w ? styles.toolBtnActive : {}), minWidth: 32 }}
+                >
+                  <div style={{ width: w, height: w, borderRadius: "50%", background: drawColor, margin: "0 auto" }} />
+                </button>
+              ))}
+              <div style={styles.toolDivider} />
+              {/* Clear */}
+              <button
+                style={{ ...styles.toolBtn, color: "#f87171" }}
+                onClick={() => send({ type: "draw-clear" })}
+              >
+                🗑 Clear
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Screen area */}
       <div style={styles.screenWrap}>
         {status === "idle" && (
           <div style={styles.splash}>
@@ -350,39 +344,31 @@ export default function App() {
             <p style={styles.splashHint}>Make sure <code style={styles.code}>python agent.py</code> is running on your PC</p>
           </div>
         )}
+
         <div
           ref={containerRef}
           style={{
             ...styles.videoContainer,
             display: status === "connected" ? "block" : "none",
-            cursor: "none",
+            cursor: drawMode ? "crosshair" : "none",
           }}
           onMouseMove={handleMouseMove}
           onMouseDown={handleMouseDown}
           onMouseUp={handleMouseUp}
           onWheel={handleWheel}
           onContextMenu={(e) => e.preventDefault()}
-          onClick={enablePointerLock}
+          onClick={!drawMode ? enablePointerLock : undefined}
         >
           <video ref={videoRef} autoPlay playsInline muted style={styles.video} />
 
-          {/* Remote cursor overlay */}
-          <div
-            style={{
-              position: "absolute",
-              left: cursorPos.left,
-              top: cursorPos.top,
-              width: 20,
-              height: 20,
-              transform: "translate(-2px, -2px)",
-              pointerEvents: "none",
-              zIndex: 10,
-            }}
-          >
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <path d="M2 2L2 14L5.5 10.5L8 17L10 16L7.5 9.5L12 9.5L2 2Z" fill="white" stroke="black" strokeWidth="1.2" strokeLinejoin="round"/>
-            </svg>
-          </div>
+          {/* Remote cursor — hide in draw mode */}
+          {!drawMode && (
+            <div style={{ position: "absolute", left: cursorPos.left, top: cursorPos.top, width: 20, height: 20, transform: "translate(-2px,-2px)", pointerEvents: "none", zIndex: 10 }}>
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                <path d="M2 2L2 14L5.5 10.5L8 17L10 16L7.5 9.5L12 9.5L2 2Z" fill="white" stroke="black" strokeWidth="1.2" strokeLinejoin="round"/>
+              </svg>
+            </div>
+          )}
         </div>
       </div>
 
@@ -390,9 +376,9 @@ export default function App() {
         @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { background: #090c10; }
-        @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:0.3 } }
-        @keyframes spin { to { transform: rotate(360deg) } }
-        @keyframes fadeIn { from { opacity:0; transform:translateY(12px) } to { opacity:1; transform:none } }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        @keyframes spin { to{transform:rotate(360deg)} }
+        @keyframes fadeIn { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:none} }
       `}</style>
     </div>
   );
@@ -405,14 +391,19 @@ const styles = {
   logoIcon: { fontSize: 20, color: "#38bdf8" },
   logoText: { fontWeight: 800, fontSize: 16, letterSpacing: "-0.03em", color: "#f1f5f9" },
   statusRow: { display: "flex", alignItems: "center", gap: 10, flex: 1, justifyContent: "center" },
-  stat: { fontFamily: "'Space Mono', monospace", fontSize: 11, color: "#64748b", letterSpacing: "0.02em" },
+  stat: { fontFamily: "'Space Mono', monospace", fontSize: 11, color: "#64748b" },
   dot: { width: 7, height: 7, borderRadius: "50%" },
   controls: { display: "flex", alignItems: "center", gap: 10 },
   hint: { fontFamily: "'Space Mono', monospace", fontSize: 10, color: "#475569" },
-  btn: { padding: "6px 14px", borderRadius: 6, border: "1px solid #1e2733", background: "#141b24", color: "#94a3b8", fontSize: 12, fontFamily: "'Syne', sans-serif", fontWeight: 600, cursor: "pointer", transition: "all 0.15s" },
+  btn: { padding: "6px 14px", borderRadius: 6, border: "1px solid #1e2733", background: "#141b24", color: "#94a3b8", fontSize: 12, fontFamily: "'Syne', sans-serif", fontWeight: 600, cursor: "pointer" },
   btnPrimary: { background: "#0ea5e9", border: "1px solid #38bdf8", color: "#fff" },
   btnDanger: { background: "#1a1a2e", border: "1px solid #f87171", color: "#f87171" },
   btnLarge: { padding: "12px 28px", fontSize: 14, borderRadius: 8 },
+  toolbar: { display: "flex", alignItems: "center", gap: 6, padding: "6px 16px", background: "#0d1117", borderBottom: "1px solid #1e2733", flexShrink: 0, flexWrap: "wrap" },
+  toolBtn: { padding: "4px 10px", borderRadius: 5, border: "1px solid #1e2733", background: "#141b24", color: "#94a3b8", fontSize: 12, fontFamily: "'Syne', sans-serif", cursor: "pointer", display: "flex", alignItems: "center", gap: 4 },
+  toolBtnActive: { background: "#1e3a5f", border: "1px solid #38bdf8", color: "#e2e8f0" },
+  toolDivider: { width: 1, height: 20, background: "#1e2733", margin: "0 4px" },
+  colorSwatch: { width: 18, height: 18, borderRadius: "50%", border: "none", cursor: "pointer", flexShrink: 0 },
   screenWrap: { flex: 1, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", position: "relative" },
   videoContainer: { position: "absolute", inset: 0, background: "#000" },
   video: { width: "100%", height: "100%", objectFit: "contain", display: "block" },
