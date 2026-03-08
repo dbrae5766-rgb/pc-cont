@@ -1,11 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { createClient } from "@supabase/supabase-js";
 
-// ── Config — fill these in ───────────────────────────────────────────────────
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 const CHANNEL_NAME = "remotedesk-signal";
-// ─────────────────────────────────────────────────────────────────────────────
 
 const ICE_SERVERS = {
   iceServers: [
@@ -20,7 +18,7 @@ const ICE_SERVERS = {
 };
 
 export default function App() {
-  const [status, setStatus] = useState("idle"); // idle | connecting | connected | error
+  const [status, setStatus] = useState("idle");
   const [error, setError] = useState(null);
   const [isPointerLocked, setIsPointerLocked] = useState(false);
   const [resolution, setResolution] = useState({ w: 0, h: 0 });
@@ -34,49 +32,34 @@ export default function App() {
   const fpsCounterRef = useRef({ frames: 0, last: Date.now() });
   const containerRef = useRef(null);
 
-  // ── Supabase signaling ──────────────────────────────────────────────────
   const setupSignaling = useCallback(async () => {
     const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
     supabaseRef.current = supabase;
-
     const channel = supabase.channel(CHANNEL_NAME, {
       config: { broadcast: { self: false } },
     });
     channelRef.current = channel;
-
     channel.on("broadcast", { event: "signal" }, async ({ payload }) => {
       await handleSignal(payload);
     });
-
     await channel.subscribe();
     return channel;
   }, []);
 
   const broadcast = useCallback(async (payload) => {
     if (channelRef.current) {
-      await channelRef.current.send({
-        type: "broadcast",
-        event: "signal",
-        payload,
-      });
+      await channelRef.current.send({ type: "broadcast", event: "signal", payload });
     }
   }, []);
 
-  // ── WebRTC setup ────────────────────────────────────────────────────────
   const handleSignal = useCallback(async (data) => {
     const pc = pcRef.current;
     if (!pc) return;
-
     if (data.type === "answer") {
-      await pc.setRemoteDescription(
-        new RTCSessionDescription({ type: "answer", sdp: data.sdp })
-      );
+      await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: data.sdp }));
     } else if (data.type === "ice-candidate" && data.candidate) {
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(data));
-      } catch (e) {
-        console.warn("ICE candidate error:", e);
-      }
+      try { await pc.addIceCandidate(new RTCIceCandidate(data)); }
+      catch (e) { console.warn("ICE candidate error:", e); }
     } else if (data.type === "agent-ready") {
       console.log("Agent is ready, initiating offer...");
       await initiateOffer();
@@ -86,11 +69,7 @@ export default function App() {
   const initiateOffer = useCallback(async () => {
     const pc = pcRef.current;
     if (!pc) return;
-
-    const offer = await pc.createOffer({
-      offerToReceiveVideo: true,
-      offerToReceiveAudio: false,
-    });
+    const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: false });
     await pc.setLocalDescription(offer);
     await broadcast({ type: "offer", sdp: offer.sdp });
   }, [broadcast]);
@@ -99,31 +78,21 @@ export default function App() {
     try {
       setStatus("connecting");
       setError(null);
-
       const pc = new RTCPeerConnection(ICE_SERVERS);
       pcRef.current = pc;
-
-      // Data channel for sending input commands
       const dc = pc.createDataChannel("input", { ordered: false, maxRetransmits: 0 });
       dataChannelRef.current = dc;
-
       dc.onopen = () => console.log("Data channel open");
       dc.onclose = () => console.log("Data channel closed");
-
-      // Receive screen stream
       pc.ontrack = (event) => {
         if (videoRef.current && event.streams[0]) {
           videoRef.current.srcObject = event.streams[0];
           setStatus("connected");
-
-          // Track resolution
           const track = event.streams[0].getVideoTracks()[0];
           const settings = track.getSettings();
           setResolution({ w: settings.width || 0, h: settings.height || 0 });
         }
       };
-
-      // ICE candidates
       pc.onicecandidate = async (event) => {
         if (event.candidate) {
           await broadcast({
@@ -134,7 +103,6 @@ export default function App() {
           });
         }
       };
-
       pc.onconnectionstatechange = () => {
         const state = pc.connectionState;
         console.log("Connection state:", state);
@@ -143,20 +111,11 @@ export default function App() {
           setError("Connection lost. Is the agent running?");
         }
       };
-
-      // Setup signaling
       await setupSignaling();
-
-      // Tell agent we're ready and announce ourselves
       await broadcast({ type: "browser-connected" });
-
-      // Wait for agent-ready signal — if agent is already up it will re-announce
       setTimeout(async () => {
-        if (status !== "connected") {
-          await initiateOffer();
-        }
+        if (status !== "connected") await initiateOffer();
       }, 3000);
-
     } catch (e) {
       setStatus("error");
       setError(e.message);
@@ -172,26 +131,50 @@ export default function App() {
     setIsPointerLocked(false);
   }, []);
 
-  // ── Input capture ───────────────────────────────────────────────────────
   const send = useCallback((cmd) => {
     const dc = dataChannelRef.current;
-    if (dc && dc.readyState === "open") {
-      dc.send(JSON.stringify(cmd));
-    }
+    if (dc && dc.readyState === "open") dc.send(JSON.stringify(cmd));
   }, []);
 
+  // ── Fixed coordinate mapping ─────────────────────────────────────────────
+  // objectFit:contain letterboxes the video — we must find the actual rendered
+  // video rect inside the container, not just the container bounds.
   const getScaledCoords = useCallback((e) => {
-    if (!videoRef.current) return { x: 0, y: 0 };
-    const rect = videoRef.current.getBoundingClientRect();
-    const scaleX = (resolution.w || 1920) / rect.width;
-    const scaleY = (resolution.h || 1080) / rect.height;
+    const video = videoRef.current;
+    if (!video) return { x: 0, y: 0 };
+
+    const containerRect = video.getBoundingClientRect();
+    const vidW = resolution.w || video.videoWidth || 1920;
+    const vidH = resolution.h || video.videoHeight || 1080;
+
+    // Compute the letterboxed render rect (objectFit: contain)
+    const containerAspect = containerRect.width / containerRect.height;
+    const videoAspect = vidW / vidH;
+
+    let renderW, renderH, offsetX, offsetY;
+    if (containerAspect > videoAspect) {
+      // Pillarboxed — black bars on left/right
+      renderH = containerRect.height;
+      renderW = renderH * videoAspect;
+      offsetX = (containerRect.width - renderW) / 2;
+      offsetY = 0;
+    } else {
+      // Letterboxed — black bars on top/bottom
+      renderW = containerRect.width;
+      renderH = renderW / videoAspect;
+      offsetX = 0;
+      offsetY = (containerRect.height - renderH) / 2;
+    }
+
+    const mouseX = e.clientX - containerRect.left - offsetX;
+    const mouseY = e.clientY - containerRect.top - offsetY;
+
     return {
-      x: Math.round((e.clientX - rect.left) * scaleX),
-      y: Math.round((e.clientY - rect.top) * scaleY),
+      x: Math.round(Math.max(0, Math.min(vidW, (mouseX / renderW) * vidW))),
+      y: Math.round(Math.max(0, Math.min(vidH, (mouseY / renderH) * vidH))),
     };
   }, [resolution]);
 
-  // Enable pointer lock for seamless mouse control
   const enablePointerLock = useCallback(() => {
     containerRef.current?.requestPointerLock();
   }, []);
@@ -204,7 +187,6 @@ export default function App() {
     return () => document.removeEventListener("pointerlockchange", onLockChange);
   }, []);
 
-  // Accumulated position for pointer lock mode
   const accPos = useRef({ x: 960, y: 540 });
 
   const handleMouseMove = useCallback((e) => {
@@ -212,11 +194,27 @@ export default function App() {
       const { x, y } = getScaledCoords(e);
       send({ type: "mousemove", x, y });
     } else {
-      // In pointer lock: use movement deltas
-      const scaleX = (resolution.w || 1920) / (containerRef.current?.offsetWidth || 1920);
-      const scaleY = (resolution.h || 1080) / (containerRef.current?.offsetHeight || 1080);
-      accPos.current.x = Math.max(0, Math.min(resolution.w || 1920, accPos.current.x + e.movementX * scaleX));
-      accPos.current.y = Math.max(0, Math.min(resolution.h || 1080, accPos.current.y + e.movementY * scaleY));
+      const vidW = resolution.w || 1920;
+      const vidH = resolution.h || 1080;
+      const video = videoRef.current;
+      if (!video) return;
+      const containerRect = video.getBoundingClientRect();
+      const videoAspect = vidW / vidH;
+      const containerAspect = containerRect.width / containerRect.height;
+
+      let renderW, renderH;
+      if (containerAspect > videoAspect) {
+        renderH = containerRect.height;
+        renderW = renderH * videoAspect;
+      } else {
+        renderW = containerRect.width;
+        renderH = renderW / videoAspect;
+      }
+
+      const scaleX = vidW / renderW;
+      const scaleY = vidH / renderH;
+      accPos.current.x = Math.max(0, Math.min(vidW, accPos.current.x + e.movementX * scaleX));
+      accPos.current.y = Math.max(0, Math.min(vidH, accPos.current.y + e.movementY * scaleY));
       send({ type: "mousemove", x: Math.round(accPos.current.x), y: Math.round(accPos.current.y) });
     }
   }, [isPointerLocked, getScaledCoords, send, resolution]);
@@ -261,7 +259,6 @@ export default function App() {
     };
   }, [handleKeyDown, handleKeyUp]);
 
-  // FPS counter
   useEffect(() => {
     if (status !== "connected") return;
     const interval = setInterval(() => {
@@ -270,30 +267,24 @@ export default function App() {
       setFps(Math.round(fpsCounterRef.current.frames / elapsed));
       fpsCounterRef.current = { frames: 0, last: now };
     }, 1000);
-
     const video = videoRef.current;
     const onFrame = () => { fpsCounterRef.current.frames++; };
     video?.addEventListener("timeupdate", onFrame);
     return () => { clearInterval(interval); video?.removeEventListener("timeupdate", onFrame); };
   }, [status]);
 
-  // ── Render ──────────────────────────────────────────────────────────────
   return (
     <div style={styles.root}>
-      {/* Header bar */}
       <div style={styles.header}>
         <div style={styles.logo}>
           <span style={styles.logoIcon}>⬡</span>
           <span style={styles.logoText}>RemoteDesk</span>
         </div>
-
         <div style={styles.statusRow}>
           {status === "connected" && (
             <>
               <span style={styles.stat}>{fps} fps</span>
-              {resolution.w > 0 && (
-                <span style={styles.stat}>{resolution.w}×{resolution.h}</span>
-              )}
+              {resolution.w > 0 && <span style={styles.stat}>{resolution.w}×{resolution.h}</span>}
               <span style={{ ...styles.dot, background: "#22c55e" }} />
             </>
           )}
@@ -304,45 +295,28 @@ export default function App() {
             </>
           )}
           {status === "idle" && <span style={styles.stat}>Not connected</span>}
-          {status === "error" && (
-            <span style={{ ...styles.stat, color: "#f87171" }}>{error}</span>
-          )}
+          {status === "error" && <span style={{ ...styles.stat, color: "#f87171" }}>{error}</span>}
         </div>
-
         <div style={styles.controls}>
-          {isPointerLocked && (
-            <span style={styles.hint}>Press ESC to release mouse</span>
-          )}
+          {isPointerLocked && <span style={styles.hint}>Press ESC to release mouse</span>}
           {status === "connected" && !isPointerLocked && (
-            <button style={styles.btn} onClick={enablePointerLock}>
-              Lock Mouse
-            </button>
+            <button style={styles.btn} onClick={enablePointerLock}>Lock Mouse</button>
           )}
           {status !== "connected" && status !== "connecting" ? (
-            <button style={{ ...styles.btn, ...styles.btnPrimary }} onClick={connect}>
-              Connect
-            </button>
+            <button style={{ ...styles.btn, ...styles.btnPrimary }} onClick={connect}>Connect</button>
           ) : (
-            <button style={{ ...styles.btn, ...styles.btnDanger }} onClick={disconnect}>
-              Disconnect
-            </button>
+            <button style={{ ...styles.btn, ...styles.btnDanger }} onClick={disconnect}>Disconnect</button>
           )}
         </div>
       </div>
 
-      {/* Screen area */}
       <div style={styles.screenWrap}>
         {status === "idle" && (
           <div style={styles.splash}>
             <div style={styles.splashIcon}>⬡</div>
             <h1 style={styles.splashTitle}>RemoteDesk</h1>
-            <p style={styles.splashSub}>
-              Peer-to-peer remote desktop.<br />
-              Start the agent on your Windows PC, then click Connect.
-            </p>
-            <button style={{ ...styles.btn, ...styles.btnPrimary, ...styles.btnLarge }} onClick={connect}>
-              Connect to PC
-            </button>
+            <p style={styles.splashSub}>Peer-to-peer remote desktop.<br />Start the agent on your Windows PC, then click Connect.</p>
+            <button style={{ ...styles.btn, ...styles.btnPrimary, ...styles.btnLarge }} onClick={connect}>Connect to PC</button>
             <div style={styles.steps}>
               <div style={styles.step}><span style={styles.stepNum}>1</span> Run <code style={styles.code}>python agent.py</code> on your PC</div>
               <div style={styles.step}><span style={styles.stepNum}>2</span> Click Connect above</div>
@@ -350,7 +324,6 @@ export default function App() {
             </div>
           </div>
         )}
-
         {status === "connecting" && (
           <div style={styles.splash}>
             <div style={styles.spinner} />
@@ -358,7 +331,6 @@ export default function App() {
             <p style={styles.splashHint}>Make sure <code style={styles.code}>python agent.py</code> is running on your PC</p>
           </div>
         )}
-
         <div
           ref={containerRef}
           style={{
@@ -373,13 +345,7 @@ export default function App() {
           onContextMenu={(e) => e.preventDefault()}
           onClick={enablePointerLock}
         >
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted
-            style={styles.video}
-          />
+          <video ref={videoRef} autoPlay playsInline muted style={styles.video} />
         </div>
       </div>
 
@@ -396,26 +362,8 @@ export default function App() {
 }
 
 const styles = {
-  root: {
-    fontFamily: "'Syne', sans-serif",
-    background: "#090c10",
-    color: "#e2e8f0",
-    height: "100vh",
-    display: "flex",
-    flexDirection: "column",
-    overflow: "hidden",
-  },
-  header: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    padding: "0 20px",
-    height: 52,
-    background: "#0d1117",
-    borderBottom: "1px solid #1e2733",
-    flexShrink: 0,
-    gap: 16,
-  },
+  root: { fontFamily: "'Syne', sans-serif", background: "#090c10", color: "#e2e8f0", height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" },
+  header: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 20px", height: 52, background: "#0d1117", borderBottom: "1px solid #1e2733", flexShrink: 0, gap: 16 },
   logo: { display: "flex", alignItems: "center", gap: 8 },
   logoIcon: { fontSize: 20, color: "#38bdf8" },
   logoText: { fontWeight: 800, fontSize: 16, letterSpacing: "-0.03em", color: "#f1f5f9" },
@@ -424,78 +372,21 @@ const styles = {
   dot: { width: 7, height: 7, borderRadius: "50%" },
   controls: { display: "flex", alignItems: "center", gap: 10 },
   hint: { fontFamily: "'Space Mono', monospace", fontSize: 10, color: "#475569" },
-  btn: {
-    padding: "6px 14px",
-    borderRadius: 6,
-    border: "1px solid #1e2733",
-    background: "#141b24",
-    color: "#94a3b8",
-    fontSize: 12,
-    fontFamily: "'Syne', sans-serif",
-    fontWeight: 600,
-    cursor: "pointer",
-    transition: "all 0.15s",
-  },
+  btn: { padding: "6px 14px", borderRadius: 6, border: "1px solid #1e2733", background: "#141b24", color: "#94a3b8", fontSize: 12, fontFamily: "'Syne', sans-serif", fontWeight: 600, cursor: "pointer", transition: "all 0.15s" },
   btnPrimary: { background: "#0ea5e9", border: "1px solid #38bdf8", color: "#fff" },
   btnDanger: { background: "#1a1a2e", border: "1px solid #f87171", color: "#f87171" },
   btnLarge: { padding: "12px 28px", fontSize: 14, borderRadius: 8 },
-  screenWrap: {
-    flex: 1,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    overflow: "hidden",
-    position: "relative",
-  },
-  videoContainer: {
-    position: "absolute",
-    inset: 0,
-    background: "#000",
-  },
-  video: {
-    width: "100%",
-    height: "100%",
-    objectFit: "contain",
-    display: "block",
-  },
-  splash: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    gap: 20,
-    textAlign: "center",
-    animation: "fadeIn 0.4s ease",
-    padding: 40,
-  },
+  screenWrap: { flex: 1, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", position: "relative" },
+  videoContainer: { position: "absolute", inset: 0, background: "#000" },
+  video: { width: "100%", height: "100%", objectFit: "contain", display: "block" },
+  splash: { display: "flex", flexDirection: "column", alignItems: "center", gap: 20, textAlign: "center", animation: "fadeIn 0.4s ease", padding: 40 },
   splashIcon: { fontSize: 48, color: "#38bdf8", lineHeight: 1 },
   splashTitle: { fontSize: 42, fontWeight: 800, letterSpacing: "-0.04em", color: "#f1f5f9" },
   splashSub: { fontSize: 15, color: "#64748b", lineHeight: 1.7, maxWidth: 380 },
   splashHint: { fontSize: 13, color: "#334155", fontFamily: "'Space Mono', monospace" },
-  spinner: {
-    width: 36, height: 36,
-    border: "3px solid #1e2733",
-    borderTop: "3px solid #38bdf8",
-    borderRadius: "50%",
-    animation: "spin 0.8s linear infinite",
-  },
+  spinner: { width: 36, height: 36, border: "3px solid #1e2733", borderTop: "3px solid #38bdf8", borderRadius: "50%", animation: "spin 0.8s linear infinite" },
   steps: { display: "flex", flexDirection: "column", gap: 10, marginTop: 10 },
   step: { display: "flex", alignItems: "center", gap: 10, color: "#475569", fontSize: 13 },
-  stepNum: {
-    width: 22, height: 22,
-    borderRadius: "50%",
-    background: "#1e2733",
-    color: "#38bdf8",
-    fontSize: 11, fontWeight: 700,
-    display: "flex", alignItems: "center", justifyContent: "center",
-    flexShrink: 0,
-  },
-  code: {
-    fontFamily: "'Space Mono', monospace",
-    background: "#0d1117",
-    border: "1px solid #1e2733",
-    borderRadius: 4,
-    padding: "1px 6px",
-    fontSize: 12,
-    color: "#38bdf8",
-  },
+  stepNum: { width: 22, height: 22, borderRadius: "50%", background: "#1e2733", color: "#38bdf8", fontSize: 11, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 },
+  code: { fontFamily: "'Space Mono', monospace", background: "#0d1117", border: "1px solid #1e2733", borderRadius: 4, padding: "1px 6px", fontSize: 12, color: "#38bdf8" },
 };
