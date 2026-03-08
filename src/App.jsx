@@ -24,15 +24,18 @@ export default function App() {
   const [resolution, setResolution] = useState({ w: 0, h: 0 });
   const [fps, setFps] = useState(0);
   const [remoteCursor, setRemoteCursor] = useState({ x: -100, y: -100, sw: 1920, sh: 1080 });
+  const [gameMouseLocked, setGameMouseLocked] = useState(false); // host game has cursor locked
 
-  const videoRef = useRef(null);
-  const pcRef = useRef(null);
-  const channelRef = useRef(null);
-  const dataChannelRef = useRef(null);
-  const supabaseRef = useRef(null);
-  const fpsCounterRef = useRef({ frames: 0, last: Date.now() });
-  const containerRef = useRef(null);
+  const videoRef        = useRef(null);
+  const pcRef           = useRef(null);
+  const channelRef      = useRef(null);
+  const dataChannelRef  = useRef(null);
+  const supabaseRef     = useRef(null);
+  const fpsCounterRef   = useRef({ frames: 0, last: Date.now() });
+  const containerRef    = useRef(null);
+  const gameLockedRef   = useRef(false); // ref mirror for use inside callbacks
 
+  // ── Signaling ───────────────────────────────────────────────────────────
   const setupSignaling = useCallback(async () => {
     const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
     supabaseRef.current = supabase;
@@ -48,15 +51,22 @@ export default function App() {
   }, []);
 
   const broadcast = useCallback(async (payload) => {
-    if (channelRef.current) {
+    if (channelRef.current)
       await channelRef.current.send({ type: "broadcast", event: "signal", payload });
-    }
   }, []);
 
   const handleSignal = useCallback(async (data) => {
-    // Handle remote cursor position updates
     if (data.type === "cursor-pos") {
       setRemoteCursor({ x: data.x, y: data.y, sw: data.sw, sh: data.sh });
+      return;
+    }
+    if (data.type === "cursor-lock-change") {
+      setGameMouseLocked(data.locked);
+      gameLockedRef.current = data.locked;
+      // Auto-acquire pointer lock on browser side when game locks mouse
+      if (data.locked && containerRef.current) {
+        containerRef.current.requestPointerLock();
+      }
       return;
     }
 
@@ -88,13 +98,13 @@ export default function App() {
       pcRef.current = pc;
       const dc = pc.createDataChannel("input", { ordered: false, maxRetransmits: 0 });
       dataChannelRef.current = dc;
-      dc.onopen = () => console.log("Data channel open");
+      dc.onopen  = () => console.log("Data channel open");
       dc.onclose = () => console.log("Data channel closed");
       pc.ontrack = (event) => {
         if (videoRef.current && event.streams[0]) {
           videoRef.current.srcObject = event.streams[0];
           setStatus("connected");
-          const track = event.streams[0].getVideoTracks()[0];
+          const track    = event.streams[0].getVideoTracks()[0];
           const settings = track.getSettings();
           setResolution({ w: settings.width || 0, h: settings.height || 0 });
         }
@@ -110,8 +120,7 @@ export default function App() {
         }
       };
       pc.onconnectionstatechange = () => {
-        const state = pc.connectionState;
-        if (state === "failed" || state === "disconnected") {
+        if (["failed", "disconnected"].includes(pc.connectionState)) {
           setStatus("error");
           setError("Connection lost. Is the agent running?");
         }
@@ -128,39 +137,37 @@ export default function App() {
   }, [setupSignaling, broadcast, initiateOffer]);
 
   const disconnect = useCallback(async () => {
-    if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
+    if (pcRef.current)    { pcRef.current.close(); pcRef.current = null; }
     if (channelRef.current) { await channelRef.current.unsubscribe(); channelRef.current = null; }
-    if (videoRef.current) { videoRef.current.srcObject = null; }
+    if (videoRef.current) videoRef.current.srcObject = null;
     document.exitPointerLock?.();
     setStatus("idle");
     setIsPointerLocked(false);
+    setGameMouseLocked(false);
+    gameLockedRef.current = false;
   }, []);
 
+  // ── Input ───────────────────────────────────────────────────────────────
   const send = useCallback((cmd) => {
     const dc = dataChannelRef.current;
     if (dc && dc.readyState === "open") dc.send(JSON.stringify(cmd));
   }, []);
 
-  // Compute letterbox-aware render rect
   const getRenderRect = useCallback(() => {
     const video = videoRef.current;
     if (!video) return null;
-    const containerRect = video.getBoundingClientRect();
-    const vidW = resolution.w || video.videoWidth || 1920;
+    const cr   = video.getBoundingClientRect();
+    const vidW = resolution.w || video.videoWidth  || 1920;
     const vidH = resolution.h || video.videoHeight || 1080;
-    const containerAspect = containerRect.width / containerRect.height;
-    const videoAspect = vidW / vidH;
+    const ca   = cr.width / cr.height;
+    const va   = vidW / vidH;
     let renderW, renderH, offsetX, offsetY;
-    if (containerAspect > videoAspect) {
-      renderH = containerRect.height;
-      renderW = renderH * videoAspect;
-      offsetX = (containerRect.width - renderW) / 2;
-      offsetY = 0;
+    if (ca > va) {
+      renderH = cr.height; renderW = renderH * va;
+      offsetX = (cr.width - renderW) / 2; offsetY = 0;
     } else {
-      renderW = containerRect.width;
-      renderH = renderW / videoAspect;
-      offsetX = 0;
-      offsetY = (containerRect.height - renderH) / 2;
+      renderW = cr.width; renderH = renderW / va;
+      offsetX = 0; offsetY = (cr.height - renderH) / 2;
     }
     return { renderW, renderH, offsetX, offsetY, vidW, vidH };
   }, [resolution]);
@@ -168,21 +175,18 @@ export default function App() {
   const getScaledCoords = useCallback((e) => {
     const r = getRenderRect();
     if (!r) return { x: 0, y: 0 };
-    const containerRect = videoRef.current.getBoundingClientRect();
-    const mouseX = e.clientX - containerRect.left - r.offsetX;
-    const mouseY = e.clientY - containerRect.top - r.offsetY;
+    const cr     = videoRef.current.getBoundingClientRect();
+    const mouseX = e.clientX - cr.left - r.offsetX;
+    const mouseY = e.clientY - cr.top  - r.offsetY;
     return {
       x: Math.round(Math.max(0, Math.min(r.vidW, (mouseX / r.renderW) * r.vidW))),
       y: Math.round(Math.max(0, Math.min(r.vidH, (mouseY / r.renderH) * r.vidH))),
     };
   }, [getRenderRect]);
 
-  // Convert remote cursor screen coords → pixel position on the video element
   const getCursorPixelPos = useCallback(() => {
     const r = getRenderRect();
     if (!r) return { left: -100, top: -100 };
-    // remoteCursor.x/y are in physical screen pixels (sw × sh)
-    // map to video coords first, then to render rect pixels
     const vx = (remoteCursor.x / remoteCursor.sw) * r.vidW;
     const vy = (remoteCursor.y / remoteCursor.sh) * r.vidH;
     return {
@@ -203,32 +207,41 @@ export default function App() {
     return () => document.removeEventListener("pointerlockchange", onLockChange);
   }, []);
 
+  // Accumulated absolute position for non-game pointer lock
   const accPos = useRef({ x: 960, y: 540 });
 
   const handleMouseMove = useCallback((e) => {
+    const gameLocked = gameLockedRef.current;
+
+    if (gameLocked) {
+      // Game has cursor confined — always send raw deltas, browser must be pointer-locked
+      send({ type: "mousemove", dx: e.movementX, dy: e.movementY });
+      return;
+    }
+
     if (!isPointerLocked) {
+      // Normal absolute mode
       const { x, y } = getScaledCoords(e);
       send({ type: "mousemove", x, y });
     } else {
+      // Pointer-locked non-game: accumulate delta → absolute
       const r = getRenderRect();
       if (!r) return;
-      const scaleX = r.vidW / r.renderW;
-      const scaleY = r.vidH / r.renderH;
-      accPos.current.x = Math.max(0, Math.min(r.vidW, accPos.current.x + e.movementX * scaleX));
-      accPos.current.y = Math.max(0, Math.min(r.vidH, accPos.current.y + e.movementY * scaleY));
+      accPos.current.x = Math.max(0, Math.min(r.vidW, accPos.current.x + e.movementX * (r.vidW / r.renderW)));
+      accPos.current.y = Math.max(0, Math.min(r.vidH, accPos.current.y + e.movementY * (r.vidH / r.renderH)));
       send({ type: "mousemove", x: Math.round(accPos.current.x), y: Math.round(accPos.current.y) });
     }
   }, [isPointerLocked, getScaledCoords, getRenderRect, send]);
 
   const handleMouseDown = useCallback((e) => {
     e.preventDefault();
-    const btn = ["left", "middle", "right"][e.button] || "left";
+    const btn    = ["left", "middle", "right"][e.button] || "left";
     const { x, y } = getScaledCoords(e);
     send({ type: "mousedown", button: btn, x, y });
   }, [getScaledCoords, send]);
 
   const handleMouseUp = useCallback((e) => {
-    const btn = ["left", "middle", "right"][e.button] || "left";
+    const btn    = ["left", "middle", "right"][e.button] || "left";
     const { x, y } = getScaledCoords(e);
     send({ type: "mouseup", button: btn, x, y });
   }, [getScaledCoords, send]);
@@ -263,12 +276,12 @@ export default function App() {
   useEffect(() => {
     if (status !== "connected") return;
     const interval = setInterval(() => {
-      const now = Date.now();
+      const now     = Date.now();
       const elapsed = (now - fpsCounterRef.current.last) / 1000;
       setFps(Math.round(fpsCounterRef.current.frames / elapsed));
       fpsCounterRef.current = { frames: 0, last: now };
     }, 1000);
-    const video = videoRef.current;
+    const video   = videoRef.current;
     const onFrame = () => { fpsCounterRef.current.frames++; };
     video?.addEventListener("timeupdate", onFrame);
     return () => { clearInterval(interval); video?.removeEventListener("timeupdate", onFrame); };
@@ -288,6 +301,7 @@ export default function App() {
             <>
               <span style={styles.stat}>{fps} fps</span>
               {resolution.w > 0 && <span style={styles.stat}>{resolution.w}×{resolution.h}</span>}
+              {gameMouseLocked && <span style={{ ...styles.stat, color: "#f59e0b" }}>🎮 game lock</span>}
               <span style={{ ...styles.dot, background: "#22c55e" }} />
             </>
           )}
@@ -297,12 +311,14 @@ export default function App() {
               <span style={{ ...styles.dot, background: "#f59e0b", animation: "pulse 1s infinite" }} />
             </>
           )}
-          {status === "idle" && <span style={styles.stat}>Not connected</span>}
+          {status === "idle"  && <span style={styles.stat}>Not connected</span>}
           {status === "error" && <span style={{ ...styles.stat, color: "#f87171" }}>{error}</span>}
         </div>
         <div style={styles.controls}>
-          {isPointerLocked && <span style={styles.hint}>Press ESC to release mouse</span>}
-          {status === "connected" && !isPointerLocked && (
+          {(isPointerLocked || gameMouseLocked) && (
+            <span style={styles.hint}>Press ESC to release mouse</span>
+          )}
+          {status === "connected" && !isPointerLocked && !gameMouseLocked && (
             <button style={styles.btn} onClick={enablePointerLock}>Lock Mouse</button>
           )}
           {status !== "connected" && status !== "connecting" ? (
@@ -339,7 +355,7 @@ export default function App() {
           style={{
             ...styles.videoContainer,
             display: status === "connected" ? "block" : "none",
-            cursor: "none", // always hide browser cursor over video
+            cursor: "none",
           }}
           onMouseMove={handleMouseMove}
           onMouseDown={handleMouseDown}
@@ -363,7 +379,6 @@ export default function App() {
               zIndex: 10,
             }}
           >
-            {/* Arrow cursor shape in SVG */}
             <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
               <path d="M2 2L2 14L5.5 10.5L8 17L10 16L7.5 9.5L12 9.5L2 2Z" fill="white" stroke="black" strokeWidth="1.2" strokeLinejoin="round"/>
             </svg>
