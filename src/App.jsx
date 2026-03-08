@@ -23,6 +23,7 @@ export default function App() {
   const [isPointerLocked, setIsPointerLocked] = useState(false);
   const [resolution, setResolution] = useState({ w: 0, h: 0 });
   const [fps, setFps] = useState(0);
+  const [remoteCursor, setRemoteCursor] = useState({ x: -100, y: -100, sw: 1920, sh: 1080 });
 
   const videoRef = useRef(null);
   const pcRef = useRef(null);
@@ -53,6 +54,12 @@ export default function App() {
   }, []);
 
   const handleSignal = useCallback(async (data) => {
+    // Handle remote cursor position updates
+    if (data.type === "cursor-pos") {
+      setRemoteCursor({ x: data.x, y: data.y, sw: data.sw, sh: data.sh });
+      return;
+    }
+
     const pc = pcRef.current;
     if (!pc) return;
     if (data.type === "answer") {
@@ -61,7 +68,6 @@ export default function App() {
       try { await pc.addIceCandidate(new RTCIceCandidate(data)); }
       catch (e) { console.warn("ICE candidate error:", e); }
     } else if (data.type === "agent-ready") {
-      console.log("Agent is ready, initiating offer...");
       await initiateOffer();
     }
   }, []);
@@ -105,7 +111,6 @@ export default function App() {
       };
       pc.onconnectionstatechange = () => {
         const state = pc.connectionState;
-        console.log("Connection state:", state);
         if (state === "failed" || state === "disconnected") {
           setStatus("error");
           setError("Connection lost. Is the agent running?");
@@ -136,44 +141,55 @@ export default function App() {
     if (dc && dc.readyState === "open") dc.send(JSON.stringify(cmd));
   }, []);
 
-  // ── Fixed coordinate mapping ─────────────────────────────────────────────
-  // objectFit:contain letterboxes the video — we must find the actual rendered
-  // video rect inside the container, not just the container bounds.
-  const getScaledCoords = useCallback((e) => {
+  // Compute letterbox-aware render rect
+  const getRenderRect = useCallback(() => {
     const video = videoRef.current;
-    if (!video) return { x: 0, y: 0 };
-
+    if (!video) return null;
     const containerRect = video.getBoundingClientRect();
     const vidW = resolution.w || video.videoWidth || 1920;
     const vidH = resolution.h || video.videoHeight || 1080;
-
-    // Compute the letterboxed render rect (objectFit: contain)
     const containerAspect = containerRect.width / containerRect.height;
     const videoAspect = vidW / vidH;
-
     let renderW, renderH, offsetX, offsetY;
     if (containerAspect > videoAspect) {
-      // Pillarboxed — black bars on left/right
       renderH = containerRect.height;
       renderW = renderH * videoAspect;
       offsetX = (containerRect.width - renderW) / 2;
       offsetY = 0;
     } else {
-      // Letterboxed — black bars on top/bottom
       renderW = containerRect.width;
       renderH = renderW / videoAspect;
       offsetX = 0;
       offsetY = (containerRect.height - renderH) / 2;
     }
-
-    const mouseX = e.clientX - containerRect.left - offsetX;
-    const mouseY = e.clientY - containerRect.top - offsetY;
-
-    return {
-      x: Math.round(Math.max(0, Math.min(vidW, (mouseX / renderW) * vidW))),
-      y: Math.round(Math.max(0, Math.min(vidH, (mouseY / renderH) * vidH))),
-    };
+    return { renderW, renderH, offsetX, offsetY, vidW, vidH };
   }, [resolution]);
+
+  const getScaledCoords = useCallback((e) => {
+    const r = getRenderRect();
+    if (!r) return { x: 0, y: 0 };
+    const containerRect = videoRef.current.getBoundingClientRect();
+    const mouseX = e.clientX - containerRect.left - r.offsetX;
+    const mouseY = e.clientY - containerRect.top - r.offsetY;
+    return {
+      x: Math.round(Math.max(0, Math.min(r.vidW, (mouseX / r.renderW) * r.vidW))),
+      y: Math.round(Math.max(0, Math.min(r.vidH, (mouseY / r.renderH) * r.vidH))),
+    };
+  }, [getRenderRect]);
+
+  // Convert remote cursor screen coords → pixel position on the video element
+  const getCursorPixelPos = useCallback(() => {
+    const r = getRenderRect();
+    if (!r) return { left: -100, top: -100 };
+    // remoteCursor.x/y are in physical screen pixels (sw × sh)
+    // map to video coords first, then to render rect pixels
+    const vx = (remoteCursor.x / remoteCursor.sw) * r.vidW;
+    const vy = (remoteCursor.y / remoteCursor.sh) * r.vidH;
+    return {
+      left: r.offsetX + (vx / r.vidW) * r.renderW,
+      top:  r.offsetY + (vy / r.vidH) * r.renderH,
+    };
+  }, [remoteCursor, getRenderRect]);
 
   const enablePointerLock = useCallback(() => {
     containerRef.current?.requestPointerLock();
@@ -194,30 +210,15 @@ export default function App() {
       const { x, y } = getScaledCoords(e);
       send({ type: "mousemove", x, y });
     } else {
-      const vidW = resolution.w || 1920;
-      const vidH = resolution.h || 1080;
-      const video = videoRef.current;
-      if (!video) return;
-      const containerRect = video.getBoundingClientRect();
-      const videoAspect = vidW / vidH;
-      const containerAspect = containerRect.width / containerRect.height;
-
-      let renderW, renderH;
-      if (containerAspect > videoAspect) {
-        renderH = containerRect.height;
-        renderW = renderH * videoAspect;
-      } else {
-        renderW = containerRect.width;
-        renderH = renderW / videoAspect;
-      }
-
-      const scaleX = vidW / renderW;
-      const scaleY = vidH / renderH;
-      accPos.current.x = Math.max(0, Math.min(vidW, accPos.current.x + e.movementX * scaleX));
-      accPos.current.y = Math.max(0, Math.min(vidH, accPos.current.y + e.movementY * scaleY));
+      const r = getRenderRect();
+      if (!r) return;
+      const scaleX = r.vidW / r.renderW;
+      const scaleY = r.vidH / r.renderH;
+      accPos.current.x = Math.max(0, Math.min(r.vidW, accPos.current.x + e.movementX * scaleX));
+      accPos.current.y = Math.max(0, Math.min(r.vidH, accPos.current.y + e.movementY * scaleY));
       send({ type: "mousemove", x: Math.round(accPos.current.x), y: Math.round(accPos.current.y) });
     }
-  }, [isPointerLocked, getScaledCoords, send, resolution]);
+  }, [isPointerLocked, getScaledCoords, getRenderRect, send]);
 
   const handleMouseDown = useCallback((e) => {
     e.preventDefault();
@@ -272,6 +273,8 @@ export default function App() {
     video?.addEventListener("timeupdate", onFrame);
     return () => { clearInterval(interval); video?.removeEventListener("timeupdate", onFrame); };
   }, [status]);
+
+  const cursorPos = getCursorPixelPos();
 
   return (
     <div style={styles.root}>
@@ -336,7 +339,7 @@ export default function App() {
           style={{
             ...styles.videoContainer,
             display: status === "connected" ? "block" : "none",
-            cursor: isPointerLocked ? "none" : "default",
+            cursor: "none", // always hide browser cursor over video
           }}
           onMouseMove={handleMouseMove}
           onMouseDown={handleMouseDown}
@@ -346,6 +349,25 @@ export default function App() {
           onClick={enablePointerLock}
         >
           <video ref={videoRef} autoPlay playsInline muted style={styles.video} />
+
+          {/* Remote cursor overlay */}
+          <div
+            style={{
+              position: "absolute",
+              left: cursorPos.left,
+              top: cursorPos.top,
+              width: 20,
+              height: 20,
+              transform: "translate(-2px, -2px)",
+              pointerEvents: "none",
+              zIndex: 10,
+            }}
+          >
+            {/* Arrow cursor shape in SVG */}
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M2 2L2 14L5.5 10.5L8 17L10 16L7.5 9.5L12 9.5L2 2Z" fill="white" stroke="black" strokeWidth="1.2" strokeLinejoin="round"/>
+            </svg>
+          </div>
         </div>
       </div>
 
